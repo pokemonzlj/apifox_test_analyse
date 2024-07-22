@@ -6,6 +6,8 @@ import requests
 import json  # 标准库 json 主要用于 JSON 数据的读取和写入，而不提供直接的 JSONPath 功能
 from jsonpath_ng import jsonpath, parse  # 专门的 JSONPath 解析库
 import configparser
+import openpyxl
+import re
 
 
 class apifox_auto_test():
@@ -15,19 +17,26 @@ class apifox_auto_test():
         self.total_online_fail_case = 0
         self.jsonfile_list = []
         self.total_fail_case_info = {}
-        self.config = configparser.ConfigParser()
-        self.config.read("apifox_url.ini", encoding="utf-8")
-        # self.config.read("apifox_url_online.ini", encoding="utf-8")
-        # self.apifox_url_list = list(self.config['URL'].values())
-        self.apifox_url_list = [line.split(' ')[2] for line in self.config['URL'].values()]
+        # self.config = configparser.ConfigParser()
+        # self.config.read("apifox_url.ini", encoding="utf-8")
+        # # self.config.read("apifox_url_online.ini", encoding="utf-8")
+        # # self.apifox_url_list = list(self.config['URL'].values())
+        # self.apifox_url_list = [line.split(' ')[2] for line in self.config['URL'].values()]
+        workbook = openpyxl.load_workbook('apifox_url.xlsx')
+        worksheet = workbook.active
+        values = [cell.value for cell in worksheet['H'] if cell.value is not None]
+        self.apifox_url_list = [value.split(' ')[2] for value in values]
+        workbook.close()
+        # print(self.apifox_url_list)
 
     def run_command(self,
-                    command="https://api.apifox.cn/api/v1/projects/"):
+                    command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4AjzH5qnAOUnX8Zw4xco7"):
         """执行apifox CLI的命令"""
+        # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
         now = datetime.now()
         date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
         filename = "apifox-report-" + f"{date_time}"
-        apifox_cli_path = "D:/Nodejs/node.exe C:/Users/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
+        apifox_cli_path = "D:/Nodejs/node.exe C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
         apifox_command = apifox_cli_path + " run " + command + " -r json" + " --out-file {}".format(filename)
         # 输出到脚本目录下\apifox-reports文件夹
         # 使用subprocess运行命令
@@ -72,49 +81,74 @@ class apifox_auto_test():
                     is_online_case = True
                 # 定义 JSONPath 表达式
                 if fail_count > 0:
+                    jsonpath_expr = parse("$.result.steps[*].id")
+                    case_id = [match.value for match in jsonpath_expr.find(data)]
+                    jsonpath_expr = parse("$.result.steps[*].name")
+                    case_name = [match.value for match in jsonpath_expr.find(data)]
+                    jsonpath_expr = parse("$.result.steps[*].metaInfo.httpApiPath")
+                    case_url = [match.value for match in jsonpath_expr.find(data)]
+                    # 先把整个用例的数据取出来，用来做下面报错数据的映射
+                    cases_dict = {id_: (name, url) for id_, name, url in zip(case_id, case_name, case_url)}
+                    # 把数据生成一个字典用来做下面的匹对
+                    # print(cases_dict)
                     jsonpath_expr = parse("$.result.failures[*].error.message")
-                    # 使用 JSONPath 表达式提取数据
                     matches_fail_reason = [match.value for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.result.failures[*].source.name")
-                    # 使用 JSONPath 表达式提取数据
-                    matches_fail_case = [match.value for match in jsonpath_expr.find(data)]
-                    # jsonpath_expr = parse("$.result.failures[0].parent.name")  # 父级肯定是同一个，所以只取第一个
-                    # # 使用 JSONPath 表达式提取数据
-                    # matches_fail_case_parent = [match.value if match.value else 'None' for match in
-                    #                             jsonpath_expr.find(data)]
-                    # if matches_fail_case_parent:
-                    #     matches_fail_case_parent = matches_fail_case_parent[0]
-                    jsonpath_expr = parse("$.result.failures[*].source.request.url.path")
-                    matches_fail_case_path_list = [match.value for match in jsonpath_expr.find(data)]
-                    # print(matches_fail_case_path_list)
-                    matches_fail_case_path_lists = []
-                    for l in matches_fail_case_path_list:
-                        matches_fail_case_path = '/'.join(l)
-                        matches_fail_case_path_lists.append(matches_fail_case_path)
-                    jsonpath_expr = parse("$.result.failures[*].source.request.url.host")
-                    matches_fail_case_host_list = [match.value for match in jsonpath_expr.find(data)]
-                    # print(matches_fail_case_host_list)
-                    matches_fail_case_host_lists = []
-                    for l in matches_fail_case_host_list:
-                        matches_fail_case_host = '.'.join(l)
-                        matches_fail_case_host_lists.append(matches_fail_case_host)
+                    jsonpath_expr = parse("$.result.failures[*].cursor.ref")
+                    matches_fail_case_id = [match.value for match in jsonpath_expr.find(data)]
+                    # print(matches_fail_case_id)
+                    matches_fail_case = []
+                    # 遍历失败ID列表
+                    j = 0
+                    for fail_id in matches_fail_case_id:
+                        # 检查fail_id是否在cases_dict中
+                        if fail_id in cases_dict:
+                            # 从字典中获取case_name和case_url
+                            case_name, case_url = cases_dict[fail_id]
+                            # 创建一个包含所需信息的字典或元组，并将其添加到列表中
+                            # 这里使用字典作为示例
+                            matches_fail_case.append({
+                                'case_name': case_name,
+                                'case_url': case_url,
+                                'fail_reason': matches_fail_reason[j]  # 获取对应的失败原因
+                            })
+                        j += 1
+                            # jsonpath_expr = parse("$.result.failures[*].source.request.url.path")
+                    # matches_fail_case_path_list = [match.value for match in jsonpath_expr.find(data)]
+                    # # print(matches_fail_case_path_list)
+                    # matches_fail_case_path_lists = []
+                    # for l in matches_fail_case_path_list:
+                    #     matches_fail_case_path = '/'.join(l)
+                    #     matches_fail_case_path_lists.append(matches_fail_case_path)
+                    # jsonpath_expr = parse("$.result.failures[*].source.request.url.host")
+                    # matches_fail_case_host_list = [match.value for match in jsonpath_expr.find(data)]
+                    # # print(matches_fail_case_host_list)
+                    # matches_fail_case_host_lists = []
+                    # for l in matches_fail_case_host_list:
+                    #     matches_fail_case_host = '.'.join(l)
+                    #     matches_fail_case_host_lists.append(matches_fail_case_host)
                     # print(matches_fail_reason)
                     # print(matches_fail_case)
-                    # print(matches_fail_case_parent)
+                    # print(len(matches_fail_case))
                     for i in range(len(matches_fail_case)):
                         fail_case = matches_fail_case[i]
-                        fail_reason = matches_fail_reason[i]
+                        fail_case_name = fail_case['case_name']
+                        fail_reason = fail_case['fail_reason']
+                        pattern = re.compile(r'expected (\d+) to be below (\d+)')
+                        # 查找匹配项
+                        match = pattern.search(fail_reason)
+                        if match:
+                            first_number = int(match.group(1))
+                            second_number = int(match.group(2))
+                            first_number = first_number/1000
+                            first_number = round(first_number, 2)
+                            fail_reason = "接口执行时间太长,耗时{}秒".format(first_number)
                         fail_case_parent = matches_fail_case_parent
-                        fail_path = matches_fail_case_path_lists[i]
-                        fail_host = matches_fail_case_host_lists[i]
-                        result_dict[fail_case] = {
+                        fail_path = fail_case['case_url']
+                        result_dict[fail_case_name] = {
                             "错误内容": fail_reason,
                             "测试用例集": fail_case_parent,
-                            "接口地址": fail_host + "/" + fail_path,
-                            # "host": fail_host
+                            "接口地址": fail_path,
                         }
-                # 打印构建的字典
-                # print(result_dict)
                 return total_count, fail_count, result_dict, is_online_case
             except json.decoder.JSONDecodeError as e:
                 print(f"JSON解析错误：{str(e)}")
@@ -128,8 +162,8 @@ class apifox_auto_test():
         # message_json = json.dumps(message)
         data = {"msg_type": "text", "content": {"text": "{}".format(message)}}
         data = json.dumps(data)
-        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/b"
-        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f"
+        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/b6f1ae63-b283-4e1e-b640-27de34b0a5dd"
+        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f6e11d6f-6f05-40c9-b105-3bf4a0dda5f2"
         if online:
             response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
         else:
@@ -158,13 +192,16 @@ class apifox_auto_test():
         message = "共测试接口用例{}条，失败{}条，其中线上{}条".format(self.total_case, self.total_fail_case, self.total_online_fail_case)
         message2 = "共测试接口用例{}条，失败{}条，失败的线下用例如下:\n".format(self.total_case, self.total_fail_case)
         if self.total_fail_case != 0:
+            i = 1
+            j = 1
             if self.total_online_fail_case == 0:
                 message += "，线上没有出问题也不错！再接再厉！"
+                for key, value in self.total_fail_case_info.items():
+                    message2 += "{}.{}: {}\n".format(j, key, value)
+                    j += 1
             else:
                 message += "，失败的线上用例如下:\n"
                 # 遍历字典的键值对并逐行输出
-                i = 1
-                j = 1
                 for key, value in self.total_fail_case_info.items():
                     if "(线上)" in value['测试用例集'] or "（线上）" in value['测试用例集']:
                         message += "{}.{}: {}\n".format(i, key, value)
