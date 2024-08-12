@@ -30,7 +30,7 @@ class apifox_auto_test():
         # print(self.apifox_url_list)
 
     def run_command(self,
-                    command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4AjzH5qnAOUnX8Zw4xco7"):
+                    command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4"):
         """执行apifox CLI的命令"""
         # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
         now = datetime.now()
@@ -54,6 +54,38 @@ class apifox_auto_test():
         except Exception as e:
             print("{}:发生错误:".format(date_time))
             print(str(e))
+
+    def deal_with_fail_reason(self, fail_reason):
+        """针对返回的结果，做一层处理后输出"""
+        pattern = re.compile(r'expected (\d+) to be below (\d+)')
+        # 查找匹配项
+        match = pattern.search(fail_reason)
+        if match:
+            first_number = int(match.group(1))
+            second_number = int(match.group(2))
+            first_number = first_number / 1000
+            first_number = round(first_number, 2)
+            second_number = second_number / 1000
+            second_number = round(second_number, 2)
+            fail_reason = "接口执行耗时{}秒，标准需要小于{}秒,要优化.".format(first_number, second_number)
+            return fail_reason
+        pattern = re.compile(r'expected (.+) to deeply equal (.+)')
+        # 查找匹配项
+        match = pattern.search(fail_reason)
+        if match:
+            first_number = int(match.group(1))
+            second_number = int(match.group(2))
+            fail_reason = "接口返回预期：{}，实际：{},存在偏差请检查.".format(second_number, first_number)
+            return fail_reason
+        pattern = re.compile(r'expected (.+) to not deeply equal (.+)')
+        # 查找匹配项
+        match = pattern.search(fail_reason)
+        if match:
+            first_number = int(match.group(1))
+            second_number = int(match.group(2))
+            fail_reason = "接口返回预期非：{}，实际：{},存在偏差请检查.".format(second_number, first_number)
+            return fail_reason
+        return fail_reason
 
     def json_analyse(self, filename="apifox-report-2023-09-12-17-20-08-602-0.json"):
         """分析输出的json报告"""
@@ -133,15 +165,7 @@ class apifox_auto_test():
                         fail_case = matches_fail_case[i]
                         fail_case_name = fail_case['case_name']
                         fail_reason = fail_case['fail_reason']
-                        pattern = re.compile(r'expected (\d+) to be below (\d+)')
-                        # 查找匹配项
-                        match = pattern.search(fail_reason)
-                        if match:
-                            first_number = int(match.group(1))
-                            second_number = int(match.group(2))
-                            first_number = first_number/1000
-                            first_number = round(first_number, 2)
-                            fail_reason = "接口执行时间太长,耗时{}秒".format(first_number)
+                        fail_reason = self.deal_with_fail_reason(fail_reason)
                         fail_case_parent = matches_fail_case_parent
                         fail_path = fail_case['case_url']
                         result_dict[fail_case_name] = {
