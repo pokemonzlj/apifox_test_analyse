@@ -186,8 +186,8 @@ class apifox_auto_test():
         # message_json = json.dumps(message)
         data = {"msg_type": "text", "content": {"text": "{}".format(message)}}
         data = json.dumps(data)
-        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/b6f1ae63-b283-4e1e-b640-27de34b0a5dd"
-        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f6e11d6f-6f05-40c9-b105-3bf4a0dda5f2"
+        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/d"
+        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f"
         if online:
             response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
         else:
