@@ -30,7 +30,7 @@ class apifox_auto_test():
         # print(self.apifox_url_list)
 
     def run_command(self,
-                    command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4"):
+                    command="https://api.apifox.cn/api/v1/projects/2875/api-test/ci-config/375963/detail?token=x4"):
         """执行apifox CLI的命令"""
         # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
         now = datetime.now()
@@ -56,7 +56,10 @@ class apifox_auto_test():
             print(str(e))
 
     def deal_with_fail_reason(self, fail_reason):
-        """针对返回的结果，做一层处理后输出"""
+        """针对返回的结果，做一层处理后输出
+        $.meta.total 小于 40110 | AssertionError: expected 40110 to be below 40110
+        接口响应小于1000ms | AssertionError: expected 1167 to be below 1000
+        """
         pattern = re.compile(r'expected (\d+) to be below (\d+)')
         # 查找匹配项
         match = pattern.search(fail_reason)
@@ -73,17 +76,17 @@ class apifox_auto_test():
         # 查找匹配项
         match = pattern.search(fail_reason)
         if match:
-            first_number = int(match.group(1))
-            second_number = int(match.group(2))
+            first_number = match.group(1)
+            second_number = match.group(2)
             fail_reason = "接口返回预期：{}，实际：{},存在偏差请检查.".format(second_number, first_number)
             return fail_reason
         pattern = re.compile(r'expected (.+) to not deeply equal (.+)')
         # 查找匹配项
         match = pattern.search(fail_reason)
         if match:
-            first_number = int(match.group(1))
-            second_number = int(match.group(2))
-            fail_reason = "接口返回预期非：{}，实际：{},存在偏差请检查.".format(second_number, first_number)
+            first_number = match.group(1)
+            second_number = match.group(2)
+            fail_reason = "接口返回预期为非：{}，实际：{},存在偏差请检查.".format(second_number, first_number)
             return fail_reason
         return fail_reason
 
@@ -123,8 +126,10 @@ class apifox_auto_test():
                     cases_dict = {id_: (name, url) for id_, name, url in zip(case_id, case_name, case_url)}
                     # 把数据生成一个字典用来做下面的匹对
                     # print(cases_dict)
-                    jsonpath_expr = parse("$.result.failures[*].error.message")
+                    jsonpath_expr = parse("$.result.failures[*].error.message")  # 错误信息
                     matches_fail_reason = [match.value for match in jsonpath_expr.find(data)]
+                    jsonpath_expr = parse("$.result.failures[*].error")  # 错误判定备注
+                    matches_fail_comment = [match.value.get('test', '无断言备注') for match in jsonpath_expr.find(data)]
                     jsonpath_expr = parse("$.result.failures[*].cursor.ref")
                     matches_fail_case_id = [match.value for match in jsonpath_expr.find(data)]
                     # print(matches_fail_case_id)
@@ -141,6 +146,7 @@ class apifox_auto_test():
                             matches_fail_case.append({
                                 'case_name': case_name,
                                 'case_url': case_url,
+                                "fail_comment": matches_fail_comment[j],  # 获取对应的失败备注
                                 'fail_reason': matches_fail_reason[j]  # 获取对应的失败原因
                             })
                         j += 1
@@ -164,11 +170,13 @@ class apifox_auto_test():
                     for i in range(len(matches_fail_case)):
                         fail_case = matches_fail_case[i]
                         fail_case_name = fail_case['case_name']
+                        fail_comment = fail_case['fail_comment']
                         fail_reason = fail_case['fail_reason']
                         fail_reason = self.deal_with_fail_reason(fail_reason)
                         fail_case_parent = matches_fail_case_parent
                         fail_path = fail_case['case_url']
                         result_dict[fail_case_name] = {
+                            "断言内容": fail_comment,
                             "错误内容": fail_reason,
                             "测试用例集": fail_case_parent,
                             "接口地址": fail_path,
@@ -181,15 +189,25 @@ class apifox_auto_test():
                 print(e)
                 return False
 
-    def send_message(self, message="", online=False):
-        """通过webhook发送消息，online是false就发通知给测试群"""
+    def send_message(self, message="", online=False, type='feishu'):
+        """通过webhook发送消息，online是false就发通知给测试群，type是feishu就发飞书群，其他则发企微"""
         # message_json = json.dumps(message)
         data = {"msg_type": "text", "content": {"text": "{}".format(message)}}
         data = json.dumps(data)
-        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/d"
+        wechat_data = {
+            "msgtype": "text",
+            "text": {
+                "content": message
+            }
+        }
+        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/b"
         webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f"
+        webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=5"
         if online:
-            response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
+            if type == 'feishu':
+                response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
+            else:
+                response = requests.post(webhook_wechat_url_online, json=wechat_data)
         else:
             response = requests.post(webhook_url_test, data=data, headers={'Content-Type': 'application/json'})
         # 检查响应结果
@@ -235,11 +253,10 @@ class apifox_auto_test():
                         j += 1
         else:
             message += "，震惊，再接再厉！"
-        self.send_message(message, online)
+        self.send_message(message, online, 'wechat')
         self.send_message(message2, False)
 
 
 if __name__ == "__main__":
     apifox_test = apifox_auto_test()
-    apifox_test.total_test(False)
-    # apifox_test.json_analyse()
+    # apifox_test.total_test(False)
