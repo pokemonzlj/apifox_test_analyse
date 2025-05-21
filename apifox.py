@@ -8,7 +8,26 @@ from jsonpath_ng import jsonpath, parse  # 专门的 JSONPath 解析库
 import configparser
 import openpyxl
 import re
+import mysql_operation
+"""
+版本更新说明：
+V1.0
+基础框架实现
+更多内容请参考apifox官方文档:https://docs.apifox.com/%E5%AE%89%E8%A3%85%E5%92%8C%E8%BF%90%E8%A1%8C-cli-5637752m0#%E8%BF%90%E8%A1%8C%E5%9C%A8%E7%BA%BF%E6%95%B0%E6%8D%AE
 
+V1.1
+apifox对apifox-report.json执行日志文件内容格式做了调整，进行适配
+
+V1.2
+对输出的执行失败结果做一个归类拆分，先输出断言预期错误的内容，再输出接口耗时超时的内容
+
+V1.3
+对每次执行的内容写入数据表apifox_fail_case做落盘，到每周、月结束做异常次数统计后输出
+
+V1.4
+1.兼容新版本的apifox CLI，可以使用新的CICD命令运行测试用例集
+2.兼容新版本CLI执行后的json日志的格式调整，调整参数取值
+"""
 
 class apifox_auto_test():
     def __init__(self):
@@ -17,29 +36,61 @@ class apifox_auto_test():
         self.total_online_fail_case = 0
         self.jsonfile_list = []
         self.total_fail_case_info = {}
-        # self.config = configparser.ConfigParser()
-        # self.config.read("apifox_url.ini", encoding="utf-8")
-        # # self.config.read("apifox_url_online.ini", encoding="utf-8")
-        # # self.apifox_url_list = list(self.config['URL'].values())
-        # self.apifox_url_list = [line.split(' ')[2] for line in self.config['URL'].values()]
+        self.apifox_access_token = "XXXXXXXXXXXXXXXXXXXXX"
         workbook = openpyxl.load_workbook('apifox_url.xlsx')
         worksheet = workbook.active
-        values = [cell.value for cell in worksheet['H'] if cell.value is not None]
-        self.apifox_url_list = [value.split(' ')[2] for value in values]
+        # self.apifox_url_list = [value.split(' ')[2] for value in values]
+
+        self.result_dict = {}
+        max_row = worksheet.max_row  # 获取工作表的最大行数
+        for row in range(1, max_row + 1):
+            key_cell = worksheet.cell(row=row, column=1)  # 获取A列单元格
+            value_cell = worksheet.cell(row=row, column=8)  # 获取H列单元格
+            key = key_cell.value
+            if key is not None:
+                value = None
+                if value_cell.value is not None:
+                    if value_cell.value.startswith("apifox run --access-token"):
+                        # 新版命令格式处理
+                        parts = value_cell.value.split(' ')
+                        try:
+                            # 找到 --access-token 参数的索引
+                            access_token_index = parts.index('--access-token')
+                            # 找到 -r 参数的索引
+                            r_index = parts.index('-r')
+                            content_parts = parts[access_token_index:r_index]
+                            content = ' '.join(content_parts)
+                            value = content
+                        except ValueError:
+                            value = None
+                    else:
+                        parts = value_cell.value.split(' ')
+                        if len(parts) >= 3:
+                            value = parts[2]
+                if value is not None:
+                    self.result_dict[key] = value
         workbook.close()
-        # print(self.apifox_url_list)
+
 
     def run_command(self,
-                    command="https://api.apifox.cn/api/v1/projects/2875/api-test/ci-config/375963/detail?token=x4"):
-        """执行apifox CLI的命令"""
-        # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
+                    command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4"):
+        """执行apifox CLI的命令,
+        新版的命令格式：
+        apifox run --access-token APS-STHxxxxxxxxxxxxxx -t 555555 -e 12222222 -n 1 -r html,cli
+        apifox run --access-token $APIFOX_ACCESS_TOKEN -t 566666 -e 12222222 -n 1 -r html,cli
+        旧版的命令格式：
+        apifox run https://api.apifox.com/api/v1/projects/2875419/api-test/ci-config/388754/detail?token=xxxxxxxxxx -r html,cli
+        使用 Apifox 的 Access Token 运行指定的测试场景或测试场景目录，示例：
+        apifox run --access-token $APIFOX_ACCESS_TOKEN -t 637132 -e 358171 -d 3497013 -r html,cli --database-connection ./database-connections.json"""
         now = datetime.now()
         date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
         filename = "apifox-report-" + f"{date_time}"
+        if "$APIFOX_ACCESS_TOKEN" in command:
+            command = command.replace("$APIFOX_ACCESS_TOKEN", self.apifox_access_token)
+        # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
         apifox_cli_path = "D:/Nodejs/node.exe C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
-        apifox_command = apifox_cli_path + " run " + command + " -r json" + " --out-file {}".format(filename)
+        apifox_command = apifox_cli_path + " run " + command + " -r json" + " --out-file {}".format(filename) + " --upload-report"
         # 输出到脚本目录下\apifox-reports文件夹
-        # 使用subprocess运行命令
         try:
             result = subprocess.check_output(apifox_command, shell=True, stderr=subprocess.STDOUT,
                                              universal_newlines=False)
@@ -93,7 +144,9 @@ class apifox_auto_test():
     def json_analyse(self, filename="apifox-report-2023-09-12-17-20-08-602-0.json"):
         """分析输出的json报告"""
         path = "apifox-reports/"
-        is_online_case = False
+        is_online_case = 0
+        date_part = filename.split("_")[0].split("-")[-3:]
+        case_occurrence_time = "-".join(date_part)
         file_path = path + filename
         if ".json" not in file_path:
             file_path += ".json"
@@ -103,36 +156,45 @@ class apifox_auto_test():
                     # 使用 json.load() 解析 JSON 文件内容为 Python 数据结构
                     data = json.load(json_file)
                 # 现在，'data' 变量包含了 JSON 文件中的数据，可以像访问字典一样访问其中的内容
-                total_count = data['result']['stats']['requests']['total']
-                fail_count = data['result']['stats']['requests']['failed']
-                result_dict = {}
+                # total_count = data['result']['stats']['requests']['total']
+                # fail_count = data['result']['stats']['requests']['failed']
+                total_count = data['result']['stats']['steps']['total']
+                fail_count = data['result']['stats']['steps']['failed']
+                result_dict_error = {}
+                result_dict_timeout = {}
                 jsonpath_expr = parse("$.collection.name")  # 取外部的整个测试用例集的名字
                 # 使用 JSONPath 表达式提取数据
                 matches_fail_case_parent = [match.value if match.value else 'None' for match in
                                             jsonpath_expr.find(data)]
                 if matches_fail_case_parent:
                     matches_fail_case_parent = matches_fail_case_parent[0]
-                if "(线上)" in matches_fail_case_parent:
-                    is_online_case = True
+                if "(线上)" in matches_fail_case_parent or "（线上）" in matches_fail_case_parent:
+                    is_online_case = 1
                 # 定义 JSONPath 表达式
                 if fail_count > 0:
-                    jsonpath_expr = parse("$.result.steps[*].id")
+                    # jsonpath_expr = parse("$.result.steps[*].id")
+                    # jsonpath_expr = parse("$.collection.item[0].item[*].id")
+                    jsonpath_expr = parse("$.run.failures[*].cursor.ref")
                     case_id = [match.value for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.result.steps[*].name")
+                    # jsonpath_expr = parse("$.result.steps[*].name")
+                    # jsonpath_expr = parse("$.collection.item[0].item[*].name")
+                    jsonpath_expr = parse("$.run.failures[*].source.name")
                     case_name = [match.value for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.result.steps[*].metaInfo.httpApiPath")
+                    # jsonpath_expr = parse("$.result.steps[*].metaInfo.httpApiPath")
+                    # jsonpath_expr = parse("$.collection.item[0].item[*].metaInfo.httpApiPath")
+                    jsonpath_expr = parse("$.run.failures[*].source.scope.httpApiPath")
                     case_url = [match.value for match in jsonpath_expr.find(data)]
                     # 先把整个用例的数据取出来，用来做下面报错数据的映射
                     cases_dict = {id_: (name, url) for id_, name, url in zip(case_id, case_name, case_url)}
                     # 把数据生成一个字典用来做下面的匹对
-                    # print(cases_dict)
-                    jsonpath_expr = parse("$.result.failures[*].error.message")  # 错误信息
+                    print(cases_dict)
+                    jsonpath_expr = parse("$.run.failures[*].error.message")  # 错误信息
                     matches_fail_reason = [match.value for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.result.failures[*].error")  # 错误判定备注
+                    jsonpath_expr = parse("$.run.failures[*].error")  # 错误判定备注
                     matches_fail_comment = [match.value.get('test', '无断言备注') for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.result.failures[*].cursor.ref")
+                    jsonpath_expr = parse("$.run.failures[*].cursor.ref")
                     matches_fail_case_id = [match.value for match in jsonpath_expr.find(data)]
-                    # print(matches_fail_case_id)
+                    print(matches_fail_case_id)
                     matches_fail_case = []
                     # 遍历失败ID列表
                     j = 0
@@ -144,43 +206,44 @@ class apifox_auto_test():
                             # 创建一个包含所需信息的字典或元组，并将其添加到列表中
                             # 这里使用字典作为示例
                             matches_fail_case.append({
+                                'occurrence_time': case_occurrence_time,
                                 'case_name': case_name,
                                 'case_url': case_url,
                                 "fail_comment": matches_fail_comment[j],  # 获取对应的失败备注
-                                'fail_reason': matches_fail_reason[j]  # 获取对应的失败原因
+                                'fail_reason': matches_fail_reason[j],  # 获取对应的失败原因
+                                'is_online': is_online_case
                             })
                         j += 1
-                            # jsonpath_expr = parse("$.result.failures[*].source.request.url.path")
-                    # matches_fail_case_path_list = [match.value for match in jsonpath_expr.find(data)]
-                    # # print(matches_fail_case_path_list)
-                    # matches_fail_case_path_lists = []
-                    # for l in matches_fail_case_path_list:
-                    #     matches_fail_case_path = '/'.join(l)
-                    #     matches_fail_case_path_lists.append(matches_fail_case_path)
-                    # jsonpath_expr = parse("$.result.failures[*].source.request.url.host")
-                    # matches_fail_case_host_list = [match.value for match in jsonpath_expr.find(data)]
-                    # # print(matches_fail_case_host_list)
-                    # matches_fail_case_host_lists = []
-                    # for l in matches_fail_case_host_list:
-                    #     matches_fail_case_host = '.'.join(l)
-                    #     matches_fail_case_host_lists.append(matches_fail_case_host)
-                    # print(matches_fail_reason)
-                    # print(matches_fail_case)
-                    # print(len(matches_fail_case))
                     for i in range(len(matches_fail_case)):
                         fail_case = matches_fail_case[i]
+                        occurrence_time = fail_case['occurrence_time']
                         fail_case_name = fail_case['case_name']
                         fail_comment = fail_case['fail_comment']
                         fail_reason = fail_case['fail_reason']
                         fail_reason = self.deal_with_fail_reason(fail_reason)
                         fail_case_parent = matches_fail_case_parent
                         fail_path = fail_case['case_url']
-                        result_dict[fail_case_name] = {
-                            "断言内容": fail_comment,
-                            "错误内容": fail_reason,
-                            "测试用例集": fail_case_parent,
-                            "接口地址": fail_path,
-                        }
+                        is_online = fail_case['is_online']
+                        if "执行耗时" not in fail_reason:  # 如果不是耗时错误，拼在第一个字典中
+                            result_dict_error[fail_case_name] = {
+                                "断言内容": fail_comment,
+                                "错误内容": fail_reason,
+                                "测试用例集": fail_case_parent,
+                                "接口地址": fail_path,
+                                "执行时间": occurrence_time,
+                                "是否线上": is_online
+                            }
+                        else:
+                            result_dict_timeout[fail_case_name] = {
+                                "断言内容": fail_comment,
+                                "错误内容": fail_reason,
+                                "测试用例集": fail_case_parent,
+                                "接口地址": fail_path,
+                                "执行时间": occurrence_time,
+                                "是否线上": is_online
+                            }
+                result_dict = {**result_dict_error, **result_dict_timeout}
+                # result_dict = result_dict_error
                 return total_count, fail_count, result_dict, is_online_case
             except json.decoder.JSONDecodeError as e:
                 print(f"JSON解析错误：{str(e)}")
@@ -200,9 +263,10 @@ class apifox_auto_test():
                 "content": message
             }
         }
-        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/b"
-        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/f"
-        webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=5"
+        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxxxxxxxxxxxxxxx"
+        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxxxxxxxxxxxx"
+        # webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxx"
+        webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxxxx"
         if online:
             if type == 'feishu':
                 response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
@@ -216,10 +280,16 @@ class apifox_auto_test():
         else:
             print(f"Failed to send message. Status code: {response.status_code}, Response: {response.text}")
 
-    def total_test(self, online=False):
-        apifox_url_list = self.apifox_url_list
-        for url in apifox_url_list:
-            self.run_command(url)
+    def total_test(self, send_online_message=False, run_online_case_only=False):
+        # apifox_url_list = self.apifox_url_list
+        self.jsonfile_list = []
+        self.total_fail_case_info = {}
+        for url in self.result_dict:
+            if run_online_case_only:  # 如果只跑正式用例
+                if "(线上)" in url or "（线上）" in url:
+                    self.run_command(self.result_dict[url])
+            else:
+                self.run_command(self.result_dict[url])
         for file in self.jsonfile_list:
             if file:
                 result = self.json_analyse(file)
@@ -231,7 +301,13 @@ class apifox_auto_test():
                 self.total_fail_case_info.update(result_dict)
                 if is_online_case:
                     self.total_online_fail_case += fail_count
+        try:
+            mysql_operation.batch_insert_fail_cases(self.total_fail_case_info)  # 将所有的失败用例写入数据库
+        except Exception as e:
+            print(e)
         message = "共测试接口用例{}条，失败{}条，其中线上{}条".format(self.total_case, self.total_fail_case, self.total_online_fail_case)
+        if run_online_case_only:
+            message = "本次执行只运行线上用例，" + message
         message2 = "共测试接口用例{}条，失败{}条，失败的线下用例如下:\n".format(self.total_case, self.total_fail_case)
         if self.total_fail_case != 0:
             i = 1
@@ -253,10 +329,11 @@ class apifox_auto_test():
                         j += 1
         else:
             message += "，震惊，再接再厉！"
-        self.send_message(message, online, 'wechat')
+        self.send_message(message, send_online_message, 'wechat')
         self.send_message(message2, False)
+
 
 
 if __name__ == "__main__":
     apifox_test = apifox_auto_test()
-    # apifox_test.total_test(False)
+    apifox_test.total_test()
