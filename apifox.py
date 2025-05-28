@@ -9,11 +9,12 @@ import configparser
 import openpyxl
 import re
 import mysql_operation
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 """
 版本更新说明：
 V1.0
 基础框架实现
-更多内容请参考apifox官方文档:https://docs.apifox.com/%E5%AE%89%E8%A3%85%E5%92%8C%E8%BF%90%E8%A1%8C-cli-5637752m0#%E8%BF%90%E8%A1%8C%E5%9C%A8%E7%BA%BF%E6%95%B0%E6%8D%AE
 
 V1.1
 apifox对apifox-report.json执行日志文件内容格式做了调整，进行适配
@@ -27,50 +28,136 @@ V1.3
 V1.4
 1.兼容新版本的apifox CLI，可以使用新的CICD命令运行测试用例集
 2.兼容新版本CLI执行后的json日志的格式调整，调整参数取值
+
+V2.0
+整体代码结构调整，重构所有的函数
 """
 
+@dataclass
+class ApifoxConfig:
+    """Apifox配置类"""
+    access_token: str = "xxxxx"
+    excel_path: str = 'apifox_url.xlsx'
+    cli_path: str = "D:/Nodejs/node.exe C:/Users/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
+    # Webhook配置
+    webhook_feishu_url_test: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
+    webhook_feishu_url_online: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx"
+    webhook_wechat_url_online: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxx"
+
+    def get_webhook_url(self, online: bool, type: str = 'feishu') -> str:
+        """获取webhook URL
+        
+        Args:
+            online: 是否为线上环境
+            type: 消息类型，'feishu'或'wechat'
+            
+        Returns:
+            str: webhook URL
+        """
+        if online:
+            return self.webhook_feishu_url_online if type == 'feishu' else self.webhook_wechat_url_online
+        return self.webhook_feishu_url_test
+
+    def get_message_data(self, message: str, type: str = 'feishu') -> dict:
+        """获取消息数据格式
+        
+        Args:
+            message: 消息内容
+            type: 消息类型，'feishu'或'wechat'
+            
+        Returns:
+            dict: 消息数据
+        """
+        if type == 'feishu':
+            return {
+                "msg_type": "text",
+                "content": {"text": message}
+            }
+        return {
+            "msgtype": "text",
+            "text": {"content": message}
+        }
+
 class apifox_auto_test():
-    def __init__(self):
-        self.total_case = 0
-        self.total_fail_case = 0
-        self.total_online_fail_case = 0
-        self.jsonfile_list = []
-        self.total_fail_case_info = {}
-        self.apifox_access_token = "XXXXXXXXXXXXXXXXXXXXX"
-        workbook = openpyxl.load_workbook('apifox_url.xlsx')
-        worksheet = workbook.active
-        # self.apifox_url_list = [value.split(' ')[2] for value in values]
+    def __init__(self, config: Optional[ApifoxConfig] = None):
+        """初始化Apifox自动化测试类
+        
+        Args:
+            config: Apifox配置对象，如果为None则使用默认配置
+        """
+        # 初始化计数器
+        self.total_case: int = 0
+        self.total_fail_case: int = 0
+        self.total_online_fail_case: int = 0
+        self.jsonfile_list: List[str] = []
+        self.total_fail_case_info: Dict = {}
+        
+        # 加载配置
+        self.config = config or ApifoxConfig()
+        
+        # 加载测试用例数据
+        try:
+            self.result_dict = self._load_test_cases()
+        except Exception as e:
+            print(f"加载测试用例失败: {str(e)}")
+            self.result_dict = {}
 
-        self.result_dict = {}
-        max_row = worksheet.max_row  # 获取工作表的最大行数
-        for row in range(1, max_row + 1):
-            key_cell = worksheet.cell(row=row, column=1)  # 获取A列单元格
-            value_cell = worksheet.cell(row=row, column=8)  # 获取H列单元格
-            key = key_cell.value
-            if key is not None:
-                value = None
-                if value_cell.value is not None:
-                    if value_cell.value.startswith("apifox run --access-token"):
-                        # 新版命令格式处理
-                        parts = value_cell.value.split(' ')
-                        try:
-                            # 找到 --access-token 参数的索引
-                            access_token_index = parts.index('--access-token')
-                            # 找到 -r 参数的索引
-                            r_index = parts.index('-r')
-                            content_parts = parts[access_token_index:r_index]
-                            content = ' '.join(content_parts)
-                            value = content
-                        except ValueError:
-                            value = None
-                    else:
-                        parts = value_cell.value.split(' ')
-                        if len(parts) >= 3:
-                            value = parts[2]
-                if value is not None:
-                    self.result_dict[key] = value
-        workbook.close()
+    def _load_test_cases(self) -> Dict[str, str]:
+        """从Excel文件加载测试用例
+        
+        Returns:
+            Dict[str, str]: 测试用例字典，key为用例名称，value为命令
+        """
+        result_dict = {}
+        try:
+            workbook = openpyxl.load_workbook(self.config.excel_path)
+            worksheet = workbook.active
+            max_row = worksheet.max_row
 
+            for row in range(1, max_row + 1):
+                key_cell = worksheet.cell(row=row, column=1)
+                value_cell = worksheet.cell(row=row, column=8)
+                
+                if key_cell.value is None:
+                    continue
+                    
+                command = self._parse_command(value_cell.value)
+                if command:
+                    result_dict[key_cell.value] = command
+                    
+            workbook.close()
+            return result_dict
+            
+        except Exception as e:
+            print(f"读取Excel文件失败: {str(e)}")
+            return {}
+
+    def _parse_command(self, command_value: Optional[str]) -> Optional[str]:
+        """解析命令字符串
+        
+        Args:
+            command_value: 命令字符串
+            
+        Returns:
+            Optional[str]: 解析后的命令，如果解析失败则返回None
+        """
+        if not command_value:
+            return None
+            
+        try:
+            if command_value.startswith("apifox run --access-token"):
+                # 新版命令格式处理
+                parts = command_value.split(' ')
+                access_token_index = parts.index('--access-token')
+                r_index = parts.index('-r')
+                return ' '.join(parts[access_token_index:r_index])
+            else:
+                # 旧版命令格式处理
+                parts = command_value.split(' ')
+                return parts[2] if len(parts) >= 3 else None
+                
+        except (ValueError, IndexError):
+            return None
 
     def run_command(self,
                     command="https://api.apifox.cn/api/v1/projects/2875535/api-test/ci-config/375963/detail?token=x4"):
@@ -86,10 +173,8 @@ class apifox_auto_test():
         date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
         filename = "apifox-report-" + f"{date_time}"
         if "$APIFOX_ACCESS_TOKEN" in command:
-            command = command.replace("$APIFOX_ACCESS_TOKEN", self.apifox_access_token)
-        # apifox_cli_path = "C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/apifox"
-        apifox_cli_path = "D:/Nodejs/node.exe C:/Users/hozest/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
-        apifox_command = apifox_cli_path + " run " + command + " -r json" + " --out-file {}".format(filename) + " --upload-report"
+            command = command.replace("$APIFOX_ACCESS_TOKEN", self.config.access_token)
+        apifox_command = self.config.cli_path + " run " + command + " -r json" + " --out-file {}".format(filename) + " --upload-report"
         # 输出到脚本目录下\apifox-reports文件夹
         try:
             result = subprocess.check_output(apifox_command, shell=True, stderr=subprocess.STDOUT,
@@ -110,6 +195,8 @@ class apifox_auto_test():
         """针对返回的结果，做一层处理后输出
         $.meta.total 小于 40110 | AssertionError: expected 40110 to be below 40110
         接口响应小于1000ms | AssertionError: expected 1167 to be below 1000
+        list内容不为[] | AssertionError: expected [] to not deeply equal []
+        list内容不为空 | AssertionError: expected '' not to be empty
         """
         pattern = re.compile(r'expected (\d+) to be below (\d+)')
         # 查找匹配项
@@ -184,62 +271,47 @@ class apifox_auto_test():
                     # jsonpath_expr = parse("$.collection.item[0].item[*].metaInfo.httpApiPath")
                     jsonpath_expr = parse("$.run.failures[*].source.scope.httpApiPath")
                     case_url = [match.value for match in jsonpath_expr.find(data)]
-                    # 先把整个用例的数据取出来，用来做下面报错数据的映射
-                    cases_dict = {id_: (name, url) for id_, name, url in zip(case_id, case_name, case_url)}
-                    # 把数据生成一个字典用来做下面的匹对
-                    print(cases_dict)
                     jsonpath_expr = parse("$.run.failures[*].error.message")  # 错误信息
                     matches_fail_reason = [match.value for match in jsonpath_expr.find(data)]
                     jsonpath_expr = parse("$.run.failures[*].error")  # 错误判定备注
                     matches_fail_comment = [match.value.get('test', '无断言备注') for match in jsonpath_expr.find(data)]
-                    jsonpath_expr = parse("$.run.failures[*].cursor.ref")
-                    matches_fail_case_id = [match.value for match in jsonpath_expr.find(data)]
-                    print(matches_fail_case_id)
+                    
+                    # 直接组合失败用例信息
                     matches_fail_case = []
-                    # 遍历失败ID列表
-                    j = 0
-                    for fail_id in matches_fail_case_id:
-                        # 检查fail_id是否在cases_dict中
-                        if fail_id in cases_dict:
-                            # 从字典中获取case_name和case_url
-                            case_name, case_url = cases_dict[fail_id]
-                            # 创建一个包含所需信息的字典或元组，并将其添加到列表中
-                            # 这里使用字典作为示例
-                            matches_fail_case.append({
-                                'occurrence_time': case_occurrence_time,
-                                'case_name': case_name,
-                                'case_url': case_url,
-                                "fail_comment": matches_fail_comment[j],  # 获取对应的失败备注
-                                'fail_reason': matches_fail_reason[j],  # 获取对应的失败原因
-                                'is_online': is_online_case
-                            })
-                        j += 1
-                    for i in range(len(matches_fail_case)):
-                        fail_case = matches_fail_case[i]
-                        occurrence_time = fail_case['occurrence_time']
+                    for i in range(len(case_id)):
+                        matches_fail_case.append({
+                            'occurrence_time': case_occurrence_time,
+                            'case_name': case_name[i],
+                            'case_url': case_url[i],
+                            "fail_comment": matches_fail_comment[i],
+                            'fail_reason': matches_fail_reason[i],
+                            'is_online': is_online_case
+                        })
+
+                    for fail_case in matches_fail_case:
                         fail_case_name = fail_case['case_name']
                         fail_comment = fail_case['fail_comment']
                         fail_reason = fail_case['fail_reason']
                         fail_reason = self.deal_with_fail_reason(fail_reason)
-                        fail_case_parent = matches_fail_case_parent
                         fail_path = fail_case['case_url']
                         is_online = fail_case['is_online']
+                        
                         if "执行耗时" not in fail_reason:  # 如果不是耗时错误，拼在第一个字典中
                             result_dict_error[fail_case_name] = {
                                 "断言内容": fail_comment,
                                 "错误内容": fail_reason,
-                                "测试用例集": fail_case_parent,
+                                "测试用例集": matches_fail_case_parent,
                                 "接口地址": fail_path,
-                                "执行时间": occurrence_time,
+                                "执行时间": case_occurrence_time,
                                 "是否线上": is_online
                             }
                         else:
                             result_dict_timeout[fail_case_name] = {
                                 "断言内容": fail_comment,
                                 "错误内容": fail_reason,
-                                "测试用例集": fail_case_parent,
+                                "测试用例集": matches_fail_case_parent,
                                 "接口地址": fail_path,
-                                "执行时间": occurrence_time,
+                                "执行时间": case_occurrence_time,
                                 "是否线上": is_online
                             }
                 result_dict = {**result_dict_error, **result_dict_timeout}
@@ -252,85 +324,159 @@ class apifox_auto_test():
                 print(e)
                 return False
 
-    def send_message(self, message="", online=False, type='feishu'):
-        """通过webhook发送消息，online是false就发通知给测试群，type是feishu就发飞书群，其他则发企微"""
-        # message_json = json.dumps(message)
-        data = {"msg_type": "text", "content": {"text": "{}".format(message)}}
-        data = json.dumps(data)
-        wechat_data = {
-            "msgtype": "text",
-            "text": {
-                "content": message
-            }
-        }
-        webhook_url_test = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxxxxxxxxxxxxxxx"
-        webhook_url_online = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxxxxxxxxxxxx"
-        # webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxx"
-        webhook_wechat_url_online = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxxxx"
-        if online:
-            if type == 'feishu':
-                response = requests.post(webhook_url_online, data=data, headers={'Content-Type': 'application/json'})
-            else:
-                response = requests.post(webhook_wechat_url_online, json=wechat_data)
-        else:
-            response = requests.post(webhook_url_test, data=data, headers={'Content-Type': 'application/json'})
-        # 检查响应结果
-        if response.status_code == 200:
-            print("Message sent successfully.")
-        else:
-            print(f"Failed to send message. Status code: {response.status_code}, Response: {response.text}")
-
-    def total_test(self, send_online_message=False, run_online_case_only=False):
-        # apifox_url_list = self.apifox_url_list
-        self.jsonfile_list = []
-        self.total_fail_case_info = {}
-        for url in self.result_dict:
-            if run_online_case_only:  # 如果只跑正式用例
-                if "(线上)" in url or "（线上）" in url:
-                    self.run_command(self.result_dict[url])
-            else:
-                self.run_command(self.result_dict[url])
-        for file in self.jsonfile_list:
-            if file:
-                result = self.json_analyse(file)
-                if not result:
-                    continue
-                total_count, fail_count, result_dict, is_online_case = result
-                self.total_case += total_count
-                self.total_fail_case += fail_count
-                self.total_fail_case_info.update(result_dict)
-                if is_online_case:
-                    self.total_online_fail_case += fail_count
+    def send_message(self, message: str = "", online: bool = False, type: str = 'feishu') -> None:
+        """通过webhook发送消息
+        
+        Args:
+            message: 消息内容
+            online: 是否为线上环境
+            type: 消息类型，'feishu'或'wechat'
+        """
         try:
-            mysql_operation.batch_insert_fail_cases(self.total_fail_case_info)  # 将所有的失败用例写入数据库
+            # 获取webhook URL
+            webhook_url = self.config.get_webhook_url(online, type)
+            
+            # 获取消息数据
+            message_data = self.config.get_message_data(message, type)
+            
+            # 发送请求
+            headers = {'Content-Type': 'application/json'} if type == 'feishu' else None
+            response = requests.post(
+                webhook_url,
+                json=message_data if type == 'wechat' else None,
+                data=json.dumps(message_data) if type == 'feishu' else None,
+                headers=headers
+            )
+            
+            # 检查响应结果
+            if response.status_code == 200:
+                print("消息发送成功")
+            else:
+                print(f"消息发送失败. 状态码: {response.status_code}, 响应: {response.text}")
+                
         except Exception as e:
-            print(e)
-        message = "共测试接口用例{}条，失败{}条，其中线上{}条".format(self.total_case, self.total_fail_case, self.total_online_fail_case)
+            print(f"发送消息时发生错误: {str(e)}")
+
+    def _execute_test_cases(self, run_online_case_only: bool) -> None:
+        """执行测试用例
+        
+        Args:
+            run_online_case_only: 是否只执行线上用例
+        """
+        for url in self.result_dict:
+            if run_online_case_only and not ("(线上)" in url or "（线上）" in url):
+                continue
+            self.run_command(self.result_dict[url])
+
+    def _process_test_results(self) -> None:
+        """处理测试结果"""
+        for file in self.jsonfile_list:
+            if not file:
+                continue
+                
+            result = self.json_analyse(file)
+            if not result:
+                continue
+                
+            total_count, fail_count, result_dict, is_online_case = result
+            self.total_case += total_count
+            self.total_fail_case += fail_count
+            self.total_fail_case_info.update(result_dict)
+            if is_online_case:
+                self.total_online_fail_case += fail_count
+
+    def _generate_summary_message(self, run_online_case_only: bool) -> str:
+        """生成测试总结消息
+        
+        Args:
+            run_online_case_only: 是否只执行线上用例
+            
+        Returns:
+            str: 总结消息
+        """
+        message = "共测试接口用例{}条，失败{}条，其中线上{}条".format(
+            self.total_case, self.total_fail_case, self.total_online_fail_case
+        )
+        
         if run_online_case_only:
             message = "本次执行只运行线上用例，" + message
-        message2 = "共测试接口用例{}条，失败{}条，失败的线下用例如下:\n".format(self.total_case, self.total_fail_case)
-        if self.total_fail_case != 0:
-            i = 1
-            j = 1
-            if self.total_online_fail_case == 0:
-                message += "，线上没有出问题也不错！再接再厉！"
-                for key, value in self.total_fail_case_info.items():
-                    message2 += "{}.{}: {}\n".format(j, key, value)
-                    j += 1
+            
+        if self.total_fail_case == 0:
+            return message + "，震惊，再接再厉！"
+            
+        if self.total_online_fail_case == 0:
+            return message + "，线上没有出问题也不错！再接再厉！"
+            
+        return message + "，失败的线上用例如下:\n"
+
+    def _generate_fail_case_messages(self) -> Tuple[str, str]:
+        """生成失败用例消息
+        
+        Returns:
+            Tuple[str, str]: (线上失败用例消息, 线下失败用例消息)
+        """
+        online_message = ""
+        offline_message = "共测试接口用例{}条，失败{}条，失败的线下用例如下:\n".format(
+            self.total_case, self.total_fail_case
+        )
+        
+        if self.total_fail_case == 0:
+            return online_message, offline_message
+            
+        online_index = 1
+        offline_index = 1
+        
+        for key, value in self.total_fail_case_info.items():
+            case_message = "{}.{}: {}\n".format(online_index if "(线上)" in value['测试用例集'] or "（线上）" in value['测试用例集'] else offline_index, key, value)
+            
+            if "(线上)" in value['测试用例集'] or "（线上）" in value['测试用例集']:
+                online_message += case_message
+                online_index += 1
             else:
-                message += "，失败的线上用例如下:\n"
-                # 遍历字典的键值对并逐行输出
-                for key, value in self.total_fail_case_info.items():
-                    if "(线上)" in value['测试用例集'] or "（线上）" in value['测试用例集']:
-                        message += "{}.{}: {}\n".format(i, key, value)
-                        i += 1
-                    else:
-                        message2 += "{}.{}: {}\n".format(j, key, value)
-                        j += 1
-        else:
-            message += "，震惊，再接再厉！"
-        self.send_message(message, send_online_message, 'wechat')
-        self.send_message(message2, False)
+                offline_message += case_message
+                offline_index += 1
+                
+        return online_message, offline_message
+
+    def total_test(self, send_online_message: bool = False, run_online_case_only: bool = False) -> None:
+        """执行所有测试用例并生成报告
+        
+        Args:
+            send_online_message: 是否发送线上消息
+            run_online_case_only: 是否只执行线上用例
+        """
+        # 重置计数器
+        self.jsonfile_list = []
+        self.total_fail_case_info = {}
+        self.total_case = 0
+        self.total_fail_case = 0
+        self.total_online_fail_case = 0
+        
+        try:
+            # 执行测试用例
+            self._execute_test_cases(run_online_case_only)
+            
+            # 处理测试结果
+            self._process_test_results()
+            
+            # 保存失败用例到数据库
+            try:
+                mysql_operation.batch_insert_fail_cases(self.total_fail_case_info)
+            except Exception as e:
+                print(f"保存失败用例到数据库时出错: {str(e)}")
+            
+            # 生成并发送消息
+            summary_message = self._generate_summary_message(run_online_case_only)
+            online_message, offline_message = self._generate_fail_case_messages()
+            
+            # 发送消息
+            self.send_message(summary_message + online_message, send_online_message, 'wechat')
+            self.send_message(offline_message, False)
+            
+        except Exception as e:
+            error_message = f"执行测试过程中发生错误: {str(e)}"
+            print(error_message)
+            self.send_message(error_message, send_online_message, 'wechat')
 
 
 
