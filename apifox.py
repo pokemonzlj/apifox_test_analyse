@@ -11,6 +11,9 @@ import re
 import mysql_operation
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 """
 版本更新说明：
 V1.0
@@ -31,18 +34,24 @@ V1.4
 
 V2.0
 整体代码结构调整，重构所有的函数
+
+V3.0
+1.支持多线程运行
+2.支持指定对应项目的接口用例执行
 """
 
 @dataclass
 class ApifoxConfig:
     """Apifox配置类"""
-    access_token: str = "xxxxx"
+    access_token: str = "APS-STHxxxxxxxxxxxxxxxx"
     excel_path: str = 'apifox_url.xlsx'
     cli_path: str = "D:/Nodejs/node.exe C:/Users/AppData/Roaming/npm/node_modules/apifox-cli/bin/cli.js"
     # Webhook配置
-    webhook_feishu_url_test: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
-    webhook_feishu_url_online: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx"
-    webhook_wechat_url_online: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxx"
+    webhook_feishu_url_test: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
+    webhook_feishu_url_online: str = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
+    webhook_wechat_url_online: str = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxx"
+    # 线程池配置
+    max_workers: int = 2  # 最大线程数，线上和线下各一个线程
 
     def get_webhook_url(self, online: bool, type: str = 'feishu') -> str:
         """获取webhook URL
@@ -92,23 +101,29 @@ class apifox_auto_test():
         self.jsonfile_list: List[str] = []
         self.total_fail_case_info: Dict = {}
         
+        # 线程安全的锁
+        self._lock = threading.Lock()
+        
         # 加载配置
         self.config = config or ApifoxConfig()
         
         # 加载测试用例数据
         try:
-            self.result_dict = self._load_test_cases()
+            self.online_cases, self.offline_cases = self._load_test_cases()
         except Exception as e:
             print(f"加载测试用例失败: {str(e)}")
-            self.result_dict = {}
+            self.online_cases = {}
+            self.offline_cases = {}
 
-    def _load_test_cases(self) -> Dict[str, str]:
-        """从Excel文件加载测试用例
+    def _load_test_cases(self) -> Tuple[Dict[str, str], Dict[str, str]]:
+        """从Excel文件加载测试用例，分离线上和线下用例
         
         Returns:
-            Dict[str, str]: 测试用例字典，key为用例名称，value为命令
+            Tuple[Dict[str, str], Dict[str, str]]: (线上用例字典, 线下用例字典)
         """
-        result_dict = {}
+        online_cases = {}
+        offline_cases = {}
+        
         try:
             workbook = openpyxl.load_workbook(self.config.excel_path)
             worksheet = workbook.active
@@ -123,14 +138,18 @@ class apifox_auto_test():
                     
                 command = self._parse_command(value_cell.value)
                 if command:
-                    result_dict[key_cell.value] = command
+                    # 根据用例名称判断是否为线上用例
+                    if "(线上)" in key_cell.value or "（线上）" in key_cell.value:
+                        online_cases[key_cell.value] = command
+                    else:
+                        offline_cases[key_cell.value] = command
                     
             workbook.close()
-            return result_dict
+            return online_cases, offline_cases
             
         except Exception as e:
             print(f"读取Excel文件失败: {str(e)}")
-            return {}
+            return {}, {}
 
     def _parse_command(self, command_value: Optional[str]) -> Optional[str]:
         """解析命令字符串
@@ -172,9 +191,11 @@ class apifox_auto_test():
         now = datetime.now()
         date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
         filename = "apifox-report-" + f"{date_time}"
+        
         if "$APIFOX_ACCESS_TOKEN" in command:
             command = command.replace("$APIFOX_ACCESS_TOKEN", self.config.access_token)
-        apifox_command = self.config.cli_path + " run " + command + " -r json" + " --out-file {}".format(filename) + " --upload-report"
+        apifox_command = self.config.cli_path + " run " + command + " -r json" + " --out-file {}".format(filename) + " --upload-report" + " --verbose"
+        
         # 输出到脚本目录下\apifox-reports文件夹
         try:
             result = subprocess.check_output(apifox_command, shell=True, stderr=subprocess.STDOUT,
@@ -182,11 +203,19 @@ class apifox_auto_test():
             #  将subprocess.check_output中的universal_newlines=True参数更改为False，这将返回未解码的字节字符串，而不是尝试将其解码为文本
             print("{}:命令执行成功:".format(date_time))
             print(result.decode("utf-8"))
-            self.jsonfile_list.append(filename)
+            
+            # 使用线程锁保护共享资源
+            with self._lock:
+                self.jsonfile_list.append(filename)
+                
         except subprocess.CalledProcessError as e:
             print("{}:命令执行完成:".format(date_time))
             print(e.output.decode("utf-8"))
-            self.jsonfile_list.append(filename)
+            
+            # 使用线程锁保护共享资源
+            with self._lock:
+                self.jsonfile_list.append(filename)
+                
         except Exception as e:
             print("{}:发生错误:".format(date_time))
             print(str(e))
@@ -357,16 +386,72 @@ class apifox_auto_test():
         except Exception as e:
             print(f"发送消息时发生错误: {str(e)}")
 
-    def _execute_test_cases(self, run_online_case_only: bool) -> None:
-        """执行测试用例
+    def _execute_cases_in_thread(self, cases: Dict[str, str], thread_name: str) -> None:
+        """在线程中执行测试用例
+        
+        Args:
+            cases: 要执行的用例字典
+            thread_name: 线程名称
+        """
+        print(f"{thread_name} 开始执行，共 {len(cases)} 个用例")
+        start_time = time.time()
+        
+        for case_name, command in cases.items():
+            print(f"{thread_name} 执行用例: {case_name}")
+            self.run_command(command)
+            
+        end_time = time.time()
+        print(f"{thread_name} 执行完成，耗时: {end_time - start_time:.2f}秒")
+
+    def _execute_test_cases_parallel(self, run_online_case_only: bool) -> None:
+        """并行执行测试用例
         
         Args:
             run_online_case_only: 是否只执行线上用例
         """
-        for url in self.result_dict:
-            if run_online_case_only and not ("(线上)" in url or "（线上）" in url):
-                continue
-            self.run_command(self.result_dict[url])
+        if run_online_case_only:
+            # 只执行线上用例
+            if self.online_cases:
+                self._execute_cases_in_thread(self.online_cases, "线上用例线程")
+            return
+            
+        # 使用线程池并行执行线上和线下用例
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            futures = []
+            
+            # 提交线上用例执行任务
+            if self.online_cases:
+                future_online = executor.submit(
+                    self._execute_cases_in_thread, 
+                    self.online_cases, 
+                    "线上用例线程"
+                )
+                futures.append(future_online)
+            
+            # 提交线下用例执行任务
+            if self.offline_cases:
+                future_offline = executor.submit(
+                    self._execute_cases_in_thread, 
+                    self.offline_cases, 
+                    "线下用例线程"
+                )
+                futures.append(future_offline)
+            
+            # 等待所有任务完成
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"线程执行出错: {str(e)}")
+
+    def _execute_test_cases(self, run_online_case_only: bool) -> None:
+        """执行测试用例（兼容旧版本）
+        
+        Args:
+            run_online_case_only: 是否只执行线上用例
+        """
+        # 使用新的并行执行方法
+        self._execute_test_cases_parallel(run_online_case_only)
 
     def _process_test_results(self) -> None:
         """处理测试结果"""
@@ -379,11 +464,14 @@ class apifox_auto_test():
                 continue
                 
             total_count, fail_count, result_dict, is_online_case = result
-            self.total_case += total_count
-            self.total_fail_case += fail_count
-            self.total_fail_case_info.update(result_dict)
-            if is_online_case:
-                self.total_online_fail_case += fail_count
+            
+            # 使用线程锁保护共享计数器
+            with self._lock:
+                self.total_case += total_count
+                self.total_fail_case += fail_count
+                self.total_fail_case_info.update(result_dict)
+                if is_online_case:
+                    self.total_online_fail_case += fail_count
 
     def _generate_summary_message(self, run_online_case_only: bool) -> str:
         """生成测试总结消息
@@ -438,13 +526,56 @@ class apifox_auto_test():
                 
         return online_message, offline_message
 
-    def total_test(self, send_online_message: bool = False, run_online_case_only: bool = False) -> None:
+    def _get_case_statistics(self) -> str:
+        """获取用例统计信息
+        
+        Returns:
+            str: 统计信息字符串
+        """
+        online_count = len(self.online_cases)
+        offline_count = len(self.offline_cases)
+        total_count = online_count + offline_count
+        
+        return f"总用例数: {total_count} (线上: {online_count}, 线下: {offline_count})"
+
+    def _filter_cases_by_project(self, cases: Dict[str, str], project_keywords: List[str]) -> Dict[str, str]:
+        """根据项目关键词过滤用例
+        
+        Args:
+            cases: 用例字典
+            project_keywords: 项目关键词列表
+            
+        Returns:
+            Dict[str, str]: 过滤后的用例字典
+        """
+        if not project_keywords:
+            return cases
+            
+        filtered_cases = {}
+        for case_name, command in cases.items():
+            if any(keyword.lower() in case_name.lower() for keyword in project_keywords):
+                filtered_cases[case_name] = command
+                
+        return filtered_cases
+
+    def total_test(self, send_online_message: bool = False, run_online_case_only: bool = False, 
+                   project_keywords: Optional[List[str]] = None) -> None:
         """执行所有测试用例并生成报告
         
         Args:
             send_online_message: 是否发送线上消息
             run_online_case_only: 是否只执行线上用例
+            project_keywords: 项目关键词列表，用于过滤特定项目的用例
         """
+        # 根据项目关键词过滤用例
+        if project_keywords:
+            self.online_cases = self._filter_cases_by_project(self.online_cases, project_keywords)
+            self.offline_cases = self._filter_cases_by_project(self.offline_cases, project_keywords)
+            print(f"根据项目关键词 {project_keywords} 过滤用例")
+        
+        # 显示用例统计信息
+        print(f"用例统计: {self._get_case_statistics()}")
+        
         # 重置计数器
         self.jsonfile_list = []
         self.total_fail_case_info = {}
@@ -482,4 +613,15 @@ class apifox_auto_test():
 
 if __name__ == "__main__":
     apifox_test = apifox_auto_test()
+    
+    # 执行所有用例（多线程并行执行）
     apifox_test.total_test()
+    
+    # 只执行线上用例
+    # apifox_test.total_test(run_online_case_only=True)
+    
+    # 执行特定项目的用例
+    # apifox_test.total_test(project_keywords=["用户管理", "订单系统"])
+    
+    # 执行特定项目的线上用例
+    # apifox_test.total_test(run_online_case_only=True, project_keywords=["支付系统"])
